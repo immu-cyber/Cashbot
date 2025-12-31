@@ -1,0 +1,5 @@
+httpx
+PyJWT
+pycryptodome
+flask
+gunicorn
