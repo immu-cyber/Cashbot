@@ -6,44 +6,35 @@ import hashlib
 import base64
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
-from threading import Thread
-
-# --- START OF FLASK KEEP-ALIVE ---
-from flask import Flask
-
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is running! This page keeps Render awake."
-
-def run_web():
-    # Render assigns a port in the environment variable PORT
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run_web)
-    t.start()
-# --- END OF FLASK KEEP-ALIVE ---
 
 import httpx
-import jwt
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
+from aiohttp import web  # Web server for 24/7 hosting
 
-# ================= CONFIG =================
+# ================= CONFIGURATION =================
+# Server Config
+PORT = int(os.getenv("PORT", 10000))
+
+# App Config
 REQUEST_TIMEOUT = 30
 SALT = "j8n5HxYA0ZVF"
 ENCRYPTION_KEY = "6fbJwIfT6ibAkZo1VVKlKVl8M2Vb7GSs"
 
 FAIRBID_BURST = int(os.getenv("FAIRBID_BURST", "1"))
 FAIRBID_DELAY = float(os.getenv("FAIRBID_DELAY", "0"))
-
 GLOBAL_CONCURRENCY = int(os.getenv("GLOBAL_CONCURRENCY", "0")) or None
 FAIRBID_SEMAPHORE = asyncio.Semaphore(GLOBAL_CONCURRENCY) if GLOBAL_CONCURRENCY else None
 
-# ================= ACCOUNTS =================
+# Global Stats for Web Server
+_stats = {
+    "start_time": time.time(),
+    "total_boosts": 0,
+    "status": "Initializing",
+    "active_accounts": 0
+}
+
+# ================= ACCOUNTS LIST =================
 ACCOUNTS = [
     {
         "NAME": "cashthug",
@@ -92,7 +83,7 @@ ACCOUNTS = [
     },
 ]
 
-# ================= HELPERS =================
+# ================= HELPERS & CRYPTO =================
 def log(name: str, msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] [{name}] {msg}", flush=True)
@@ -102,72 +93,9 @@ async def create_client() -> httpx.AsyncClient:
         http2=True,
         timeout=httpx.Timeout(REQUEST_TIMEOUT),
         limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
-        headers={"User-Agent": "Mozilla/5.0 (Android)"}
+        headers={"User-Agent": "Mozilla/5.0 (Android)"},
+        verify=False
     )
-
-async def load_config(client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
-    r = await client.get(url)
-    r.raise_for_status()
-    j = r.json()
-    return {
-        "user_id": j["client_params"]["publisher_supplied_user_id"],
-        "payload": json.dumps(j, separators=(",", ":"))
-    }
-
-async def get_id_token(
-    client: httpx.AsyncClient,
-    firebase_key: str,
-    refresh_token: str
-) -> tuple[str, str, int]:
-    url = f"https://securetoken.googleapis.com/v1/token?key={firebase_key}"
-    r = await client.post(
-        url,
-        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
-        headers={"Content-Type": "application/x-www-form-urlencoded"}
-    )
-    r.raise_for_status()
-    j = r.json()
-    return j["id_token"], j["user_id"], int(j["expires_in"])
-
-class TokenManager:
-    def __init__(self, firebase_key: str, refresh_token: str):
-        self.firebase_key = firebase_key
-        self.refresh_token = refresh_token
-        self.token: Optional[str] = None
-        self.uid: Optional[str] = None
-        self._lock = asyncio.Lock()
-
-    async def get(self, client: httpx.AsyncClient) -> tuple[str, str]:
-        async with self._lock:
-            now = time.time()
-            needs_refresh = True
-
-            if self.token:
-                try:
-                    payload = jwt.decode(
-                        self.token,
-                        options={"verify_signature": False}
-                    )
-                    exp = payload.get("exp", 0)
-                    if exp > now + 120:  # ≥2 min margin
-                        needs_refresh = False
-                except Exception:
-                    pass
-
-            if needs_refresh:
-                log("TokenManager", f"🔄 Refreshing token for account")
-                self.token, self.uid, _ = await get_id_token(
-                    client, self.firebase_key, self.refresh_token
-                )
-                try:
-                    payload = jwt.decode(self.token, options={"verify_signature": False})
-                    exp_dt = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
-                    log("TokenManager", f"✅ New token valid until {exp_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                except Exception:
-                    pass
-
-            assert self.token and self.uid
-            return self.token, self.uid
 
 def build_hash_payload(user_id: str, url: str) -> str:
     now = int(time.time())
@@ -181,35 +109,58 @@ def encrypt_offer(offer_id: str) -> Dict[str, Any]:
     raw = json.dumps({"offerId": offer_id}, separators=(",", ":")).encode()
     cipher = AES.new(key, AES.MODE_ECB)
     encrypted = cipher.encrypt(pad(raw, AES.block_size))
+    return {"data": {"data": base64.b64encode(encrypted).decode()}}
+
+# ================= TOKEN MANAGER =================
+class TokenManager:
+    def __init__(self, firebase_key: str, refresh_token: str):
+        self.firebase_key = firebase_key
+        self.refresh_token = refresh_token
+        self.token: Optional[str] = None
+        self.uid: Optional[str] = None
+        self.expiry = 0
+        self._lock = asyncio.Lock()
+
+    async def get(self, client: httpx.AsyncClient) -> tuple[str, str]:
+        async with self._lock:
+            if not self.token or time.time() >= self.expiry:
+                url = f"https://securetoken.googleapis.com/v1/token?key={self.firebase_key}"
+                try:
+                    r = await client.post(
+                        url,
+                        data={"grant_type": "refresh_token", "refresh_token": self.refresh_token},
+                        headers={"Content-Type": "application/x-www-form-urlencoded"}
+                    )
+                    r.raise_for_status()
+                    j = r.json()
+                    self.token = j["id_token"]
+                    self.uid = j["user_id"]
+                    # Expire 60 seconds before actual expiry to be safe
+                    self.expiry = time.time() + int(j["expires_in"]) - 60
+                    log("TokenManager", f"🔄 Auth Refreshed for {self.uid}")
+                except Exception as e:
+                    log("TokenManager", f"❌ Auth Failed: {e}")
+                    raise e
+            return self.token, self.uid
+
+# ================= API & BOT LOGIC =================
+async def load_config(client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
+    r = await client.get(url)
+    r.raise_for_status()
+    j = r.json()
     return {
-        "data": {
-            "data": base64.b64encode(encrypted).decode()
-        }
+        "user_id": j["client_params"]["publisher_supplied_user_id"],
+        "payload": json.dumps(j, separators=(",", ":"))
     }
 
 async def call_with_auth_retry(client: httpx.AsyncClient, method: str, url: str, token: str, **kwargs):
-    for attempt in range(2):
-        req = getattr(client, method)
-        headers = kwargs.pop("headers", {})
-        headers["Authorization"] = f"Bearer {token}"
-        try:
-            r = await req(url, headers=headers, **kwargs)
-            if r.status_code == 401 and attempt == 0:
-                continue
-            r.raise_for_status()
-            return r
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 401 and attempt == 0:
-                continue
-            raise
-    raise httpx.HTTPStatusError("Auth failed after refresh", request=None, response=None)
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bearer {token}"
+    r = await getattr(client, method)(url, headers=headers, **kwargs)
+    r.raise_for_status()
+    return r
 
-async def get_super_offer(
-    client: httpx.AsyncClient,
-    token: str,
-    project_id: str,
-    uid: str
-) -> Optional[Dict[str, Any]]:
+async def get_super_offer(client, token, project_id, uid):
     url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/users/{uid}:runQuery"
     query = {
         "structuredQuery": {
@@ -225,25 +176,16 @@ async def get_super_offer(
         }
     }
     r = await call_with_auth_retry(client, "post", url, token, json=query)
-    for item in r.json():
-        if "document" in item:
-            f = item["document"]["fields"]
-            return {
-                "offerId": f["offerId"]["stringValue"],
-                "fees": int(f["fees"]["integerValue"])
-            }
+    data = r.json()
+    if data and "document" in data[0]:
+        f = data[0]["document"]["fields"]
+        return {"offerId": f["offerId"]["stringValue"], "fees": int(f.get("fees", {}).get("integerValue", 0))}
     return None
 
-async def get_boosts(
-    client: httpx.AsyncClient,
-    token: str,
-    project_id: str,
-    uid: str
-) -> int:
+async def get_boosts(client, token, project_id, uid):
     url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/users/{uid}?mask.fieldPaths=boosts"
     r = await call_with_auth_retry(client, "get", url, token)
-    doc = r.json()
-    return int(doc.get("fields", {}).get("boosts", {}).get("integerValue", 0))
+    return int(r.json().get("fields", {}).get("boosts", {}).get("integerValue", 0))
 
 async def run_fairbid(client: httpx.AsyncClient, acc: Dict[str, Any], cfg: Dict[str, Any]) -> None:
     if FAIRBID_SEMAPHORE:
@@ -256,99 +198,122 @@ async def _run_fairbid_impl(client: httpx.AsyncClient, acc: Dict[str, Any], cfg:
     try:
         url = f"{acc['BASE_URL']}?spotId={acc['SPOT_ID']}"
         r = await client.post(url, content=cfg["payload"])
-        r.raise_for_status()
         text = r.text
 
         tasks = []
         if 'impression":"' in text:
             imp_url = text.split('impression":"')[1].split('"')[0]
             tasks.append(client.get(imp_url))
+        
         if 'completion":"' in text:
             comp_url = text.split('completion":"')[1].split('"')[0]
             payload = build_hash_payload(cfg["user_id"], comp_url)
             tasks.append(client.post(comp_url, content=payload))
+            _stats["total_boosts"] += 1  # Increment global stats
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    except Exception as e:
-        log(acc["NAME"], f"❌ FairBid error: {e}")
+    except Exception:
+        pass
 
-async def call_fn(
-    client: httpx.AsyncClient,
-    token: str,
-    project_id: str,
-    name: str,
-    offer_id: str
-) -> Dict[str, Any]:
+async def call_fn(client, token, project_id, name, offer_id):
     url = f"https://us-central1-{project_id}.cloudfunctions.net/{name}"
     r = await call_with_auth_retry(client, "post", url, token, json=encrypt_offer(offer_id))
     return r.json()
 
+# ================= BOT LOOP =================
 async def bot_loop(acc: Dict[str, Any]) -> None:
     client = await create_client()
     try:
         cfg = await load_config(client, acc["JSON_URL"])
         tm = TokenManager(acc["FIREBASE_KEY"], acc["REFRESH_TOKEN"])
         log(acc["NAME"], "🟢 STARTED")
+        _stats["active_accounts"] += 1
 
         while True:
             try:
                 token, uid = await tm.get(client)
+                
+                # Check for Offers
                 offer = await get_super_offer(client, token, acc["PROJECT_ID"], uid)
                 if not offer:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(20) # Wait longer if no offers
                     continue
 
-                log(acc["NAME"], f"🎯 OFFER FOUND | ID={offer['offerId']} | FEES={offer['fees']}")
+                log(acc["NAME"], f"🎯 Found Offer: {offer['offerId']} | Needs {offer['fees']} Boosts")
                 target = offer["fees"] + 1
 
+                # Farm Boosts
                 while True:
                     boosts = await get_boosts(client, token, acc["PROJECT_ID"], uid)
-                    log(acc["NAME"], f"⚡ BOOSTS {boosts}/{target}")
                     if boosts >= target:
                         break
-                    log(acc["NAME"], f"🌀 Running FairBid burst ×{FAIRBID_BURST}...")
+                    
+                    # Run Boost Batch
                     await asyncio.gather(
                         *(run_fairbid(client, acc, cfg) for _ in range(FAIRBID_BURST)),
                         return_exceptions=True
                     )
+                    
                     if FAIRBID_DELAY > 0:
                         await asyncio.sleep(FAIRBID_DELAY)
 
-                unlock = await call_fn(client, token, acc["PROJECT_ID"], "superOffer_unlock", offer["offerId"])
-                status = unlock.get("status", "OK")
-                log(acc["NAME"], f"🔓 UNLOCK → {status}")
-
-                claim = await call_fn(client, token, acc["PROJECT_ID"], "superOffer_claim", offer["offerId"])
-                reward = claim.get("reward", "??")
-                log(acc["NAME"], f"🏆 CLAIM → {reward}")
-
-                await asyncio.sleep(3)
+                # Claim Offer
+                log(acc["NAME"], f"🔓 Unlocking {offer['offerId']}...")
+                await call_fn(client, token, acc["PROJECT_ID"], "superOffer_unlock", offer["offerId"])
+                await asyncio.sleep(1)
+                
+                log(acc["NAME"], f"🏆 Claiming {offer['offerId']}...")
+                claim_res = await call_fn(client, token, acc["PROJECT_ID"], "superOffer_claim", offer["offerId"])
+                
+                log(acc["NAME"], f"💰 Claimed! Result: {claim_res.get('status', 'OK')}")
+                await asyncio.sleep(5)
 
             except Exception as e:
-                log(acc["NAME"], f"💥 Inner loop error: {e}")
+                log(acc["NAME"], f"⚠️ Loop Error: {e}")
                 await asyncio.sleep(10)
 
     except Exception as e:
-        log(acc["NAME"], f"🚨 Bot crashed: {e}")
+        log(acc["NAME"], f"🚨 Bot Crashed: {e}")
     finally:
+        _stats["active_accounts"] -= 1
         await client.aclose()
 
+# ================= WEB SERVER =================
+async def health_check(request):
+    uptime = int(time.time() - _stats["start_time"])
+    return web.json_response({
+        "status": _stats["status"],
+        "uptime_readable": f"{uptime//3600}h {(uptime%3600)//60}m {uptime%60}s",
+        "active_accounts": _stats["active_accounts"],
+        "total_boosts_farmed": _stats["total_boosts"],
+        "system_status": "Running"
+    })
+
+async def start_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    log("SYSTEM", f"📡 Web Server running on port {PORT}")
+
+# ================= MAIN =================
 async def main() -> None:
-    log("SYSTEM", f"🚀 Bot started | Accounts: {len(ACCOUNTS)} | Burst: {FAIRBID_BURST} | Delay: {FAIRBID_DELAY}s")
-    if GLOBAL_CONCURRENCY:
-        log("SYSTEM", f"⚠️ Global concurrency limited to {GLOBAL_CONCURRENCY} FairBid requests")
+    _stats["status"] = "Running"
+    log("SYSTEM", f"🚀 Multi-Account Bot Started | Accounts: {len(ACCOUNTS)}")
     
-    try:
-        await asyncio.gather(*(bot_loop(acc) for acc in ACCOUNTS), return_exceptions=True)
-    except KeyboardInterrupt:
-        log("SYSTEM", "🛑 Interrupt received — shutting down...")
-    except Exception as e:
-        log("SYSTEM", f"🔥 Fatal error: {e}")
+    # Start Web Server and Bots together
+    await asyncio.gather(
+        start_server(),
+        *(bot_loop(acc) for acc in ACCOUNTS),
+        return_exceptions=True
+    )
 
 if __name__ == "__main__":
-    # Start the "fake" web server in a separate thread
-    keep_alive()
-    # Start the async bot loop
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
